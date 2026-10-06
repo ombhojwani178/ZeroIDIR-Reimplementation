@@ -1,114 +1,104 @@
 import os
-import argparse
-import glob
-from PIL import Image
 import torch
-import torchvision.utils as vutils
-import torchvision.transforms.functional as TF
+import torch.optim as optim
+from torch.utils.data import DataLoader
 
+from dataset.dataloader import Train_Dataset
 from models.zeroidir_model import ZeroIDIRModel
+from models.losses import ZeroIDIRLosses
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="ZeroIDIR Evaluation and Inference")
-    parser.add_argument(
-        "--weights", 
-        type=str, 
-        default="./checkpoints/zeroidir_epoch_50.pth", 
-        help="Path to trained model checkpoint"
-    )
-    parser.add_argument(
-        "--input", 
-        type=str, 
-        default="/content/dataset/LOL/eval15/low", 
-        help="Path to input test directory or single image"
-    )
-    parser.add_argument(
-        "--output", 
-        type=str, 
-        default="./results", 
-        help="Directory to save enhanced images"
-    )
-    parser.add_argument(
-        "--sampling_steps", 
-        type=int, 
-        default=20, 
-        help="DDIM sampling timesteps"
-    )
-    return parser.parse_args()
-
-def run_inference():
-    args = parse_args()
+def train():
+    # 1. Hyperparameters and Configuration
+    epochs = 50
+    batch_size = 4
+    learning_rate = 1e-4
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.output, exist_ok=True)
+    save_dir = "./checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
 
     print(f"Using device: {device}")
-    print(f"Loading checkpoint: {args.weights}")
 
-    # 1. Initialize and load model weights
-    model = ZeroIDIRModel(sampling_timesteps=args.sampling_steps).to(device)
-    if os.path.exists(args.weights):
-        state_dict = torch.load(args.weights, map_location=device)
-        model.load_state_dict(state_dict)
-        print("Checkpoint loaded successfully.")
-    else:
-        print(f"Warning: Checkpoint not found at {args.weights}. Running with initialized weights.")
+    # 2. Data Loading
+    print("Loading dataset...")
+    train_data = Train_Dataset(
+        image_dir="/content/dataset/LOL/", 
+        filelist="train_list.txt", 
+        patch_size=(256, 256)
+    )
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=2)
 
-    model.eval()
+    # 3. Model and Loss Initialization
+    print("Initializing model and losses...")
+    model = ZeroIDIRModel().to(device)
+    criterion = ZeroIDIRLosses().to(device)
+    
+    # Dual optimizers to prevent gradient conflicts between stages
+    optimizer_stage1 = optim.Adam(model.stage1.parameters(), lr=learning_rate)
+    optimizer_unet = optim.Adam(model.unet.parameters(), lr=learning_rate)
 
-    # 2. Collect image paths
-    if os.path.isdir(args.input):
-        image_paths = sorted(
-            glob.glob(os.path.join(args.input, "*.png")) + 
-            glob.glob(os.path.join(args.input, "*.jpg"))
-        )
-    elif os.path.isfile(args.input):
-        image_paths = [args.input]
-    else:
-        raise FileNotFoundError(f"Input path does not exist: {args.input}")
+    # 4. Training Loop
+    print("Starting training...")
+    for epoch in range(epochs):
+        model.train()
+        epoch_stage1_loss = 0.0
+        epoch_diff_loss = 0.0
 
-    print(f"Processing {len(image_paths)} images...")
-
-    with torch.no_grad():
-        for img_path in image_paths:
-            img_name = os.path.basename(img_path)
-            raw_img = Image.open(img_path).convert("RGB")
+        for i, batch in enumerate(train_loader):
+            low_img = batch["low_img"].to(device)
             
-            # Pad dimensions to be divisible by 16 (downsample factor requirement)
-            w, h = raw_img.size
-            pad_h = (16 - h % 16) % 16
-            pad_w = (16 - w % 16) % 16
+            # --- Forward Pass Stage 1: Illumination Correction ---
+            optimizer_stage1.zero_grad()
+            
+            stage1_enhanced = model.stage1(low_img)
+            ill_map = torch.max(low_img, dim=1, keepdim=True)[0]
+            
+            stage1_loss, l_spa, l_exp, l_col, l_tv = criterion.compute_stage1_loss(
+                stage1_enhanced, low_img, ill_map
+            )
+            
+            stage1_loss.backward()
+            optimizer_stage1.step()
+            
+            # --- Forward Pass Stage 2: Diffusion ---
+            optimizer_unet.zero_grad()
+            
+            # Detach to prevent diffusion gradients from corrupting Stage 1's zero-reference weights
+            pseudo_clean = stage1_enhanced.detach() 
 
-            input_tensor = TF.to_tensor(raw_img).unsqueeze(0).to(device)
-            if pad_h > 0 or pad_w > 0:
-                input_tensor = torch.nn.functional.pad(input_tensor, (0, pad_w, 0, pad_h), mode="reflect")
+            t = torch.randint(0, model.diffusion.num_timesteps, (low_img.shape[0],), device=device).long()
+            noise = torch.randn_like(pseudo_clean)
+            
+            # Forward diffusion on the pseudo-clean image
+            x_t = model.diffusion.q_sample(x_start=pseudo_clean, t=t, noise=noise)
+            
+            # Predict noise using the UNet conditioned on Stage 1
+            pred_noise, pred_x_start = model.diffusion.model_predictions(x_t, t, pseudo_clean * 2 - 1)
+            
+            # Compute diffusion consistency loss
+            diffusion_loss = criterion.compute_diffusion_consistency_loss(
+                pred_noise, noise, pred_x_start, pseudo_clean
+            )
+            
+            diffusion_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.unet.parameters(), 1.0)
+            optimizer_unet.step()
 
-            # Stage 1: Illumination enhancement
-            stage1_out = model.stage1(input_tensor)
+            # Tracking
+            epoch_stage1_loss += stage1_loss.item()
+            epoch_diff_loss += diffusion_loss.item()
 
-            # Stage 2: Perturbed consistency diffusion inference via DDIM
-            x_cond = stage1_out * 2.0 - 1.0
-            enhanced_output = model.diffusion.ddim_sample(x_cond)
+        # Print epoch statistics
+        avg_stage1 = epoch_stage1_loss / len(train_loader)
+        avg_diff = epoch_diff_loss / len(train_loader)
+        print(f"Epoch [{epoch+1}/{epochs}] | Stage 1 Loss: {avg_stage1:.4f} | Diff Loss: {avg_diff:.4f}")
 
-            # Rescale output to [0, 1] range
-            enhanced_output = (enhanced_output + 1.0) / 2.0
-            enhanced_output = torch.clamp(enhanced_output, 0.0, 1.0)
+        # 5. Save Checkpoints
+        if (epoch + 1) % 10 == 0:
+            checkpoint_path = os.path.join(save_dir, f"zeroidir_epoch_{epoch+1}.pth")
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"Saved checkpoint: {checkpoint_path}")
 
-            # Remove padding to restore original image aspect
-            if pad_h > 0 or pad_w > 0:
-                input_tensor = input_tensor[:, :, :h, :w]
-                enhanced_output = enhanced_output[:, :, :h, :w]
-
-            # Save restored image and a side-by-side comparison
-            save_path = os.path.join(args.output, img_name)
-            vutils.save_image(enhanced_output, save_path)
-
-            comparison_path = os.path.join(args.output, f"compare_{img_name}")
-            comparison_grid = torch.cat([input_tensor, enhanced_output], dim=3)
-            vutils.save_image(comparison_grid, comparison_path)
-
-            print(f"Saved: {img_name} -> {args.output}")
-
-    print(f"Inference complete. Results stored in {args.output}")
+    print("Training complete!")
 
 if __name__ == "__main__":
-    run_inference()
+    train()
