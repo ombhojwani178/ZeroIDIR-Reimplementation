@@ -25,9 +25,9 @@ def train():
     train_data = Train_Dataset(
         image_dir="/content/dataset/LOL/", 
         filelist="train_list.txt", 
-        patch_size=(512, 512)
+        patch_size=(256,256)
     )
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=2)
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=0)
 
     # 3. Model and Loss Initialization
     print("Initializing model and losses...")
