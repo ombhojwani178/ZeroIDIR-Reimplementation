@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -21,13 +22,18 @@ def train():
 
     # 2. Data Loading
     print("Loading dataset...")
-    # Update these paths if your Colab structure differs
     train_data = Train_Dataset(
-        image_dir="/content/dataset/LOL/", 
-        filelist="train_list.txt", 
-        patch_size=(256,256)
+        image_dir="/content/dataset/LOL/",
+        filelist="train_list.txt",
+        patch_size=(256, 256)
     )
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=0)
+
+    train_loader = DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0
+    )
 
     # 3. Model and Loss Initialization
     print("Initializing model and losses...")
@@ -37,58 +43,99 @@ def train():
 
     # 4. Training Loop
     print("Starting training...")
+
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
 
+        # Start epoch timer
+        epoch_start = time.time()
+
         for i, batch in enumerate(train_loader):
             low_img = batch["low_img"].to(device)
-            
+
             optimizer.zero_grad()
 
             # --- Forward Pass Stage 1: Illumination Correction ---
             stage1_enhanced = model.stage1(low_img)
-            
+
             # Reconstruct the illumination map for the smoothness loss calculation
             ill_map = torch.max(low_img, dim=1, keepdim=True)[0]
-            
+
             # Compute Stage 1 Zero-Reference Losses
             stage1_loss, l_spa, l_exp, l_col, l_tv = criterion.compute_stage1_loss(
-                stage1_enhanced, low_img, ill_map
+                stage1_enhanced,
+                low_img,
+                ill_map
             )
 
             # --- Forward Pass Stage 2: Diffusion ---
             # Sample random timesteps for the batch
-            t = torch.randint(0, model.diffusion.num_timesteps, (low_img.shape[0],), device=device).long()
-            
-            # Generate target noise and add it to the stage 1 output (forward diffusion)
+            t = torch.randint(
+                0,
+                model.diffusion.num_timesteps,
+                (low_img.shape[0],),
+                device=device
+            ).long()
+
+            # Generate target noise and add it to the stage 1 output
             noise = torch.randn_like(stage1_enhanced)
-            x_t = model.diffusion.q_sample(x_start=stage1_enhanced, t=t, noise=noise)
-            
-            # Predict the noise using the Unet conditioned on Stage 1
-            pred_noise, _ = model.diffusion.model_predictions(x_t, t, stage1_enhanced * 2 - 1)
-            
-            # Compute Stage 2 Diffusion Loss (MSE between predicted noise and actual noise)
-            diffusion_loss = torch.nn.functional.mse_loss(pred_noise, noise)
+
+            x_t = model.diffusion.q_sample(
+                x_start=stage1_enhanced,
+                t=t,
+                noise=noise
+            )
+
+            # Predict the noise using the U-Net conditioned on Stage 1
+            pred_noise, _ = model.diffusion.model_predictions(
+                x_t,
+                t,
+                stage1_enhanced * 2 - 1
+            )
+
+            # Compute Stage 2 Diffusion Loss
+            diffusion_loss = torch.nn.functional.mse_loss(
+                pred_noise,
+                noise
+            )
 
             # --- Backpropagation ---
             total_loss = stage1_loss + diffusion_loss
+
             total_loss.backward()
             optimizer.step()
 
             epoch_loss += total_loss.item()
 
-        # Print epoch statistics
+        # Epoch statistics
         avg_loss = epoch_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{epochs}] | Average Total Loss: {avg_loss:.4f}")
+
+        epoch_time = time.time() - epoch_start
+        epoch_minutes = epoch_time / 60
+
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] | "
+            f"Average Total Loss: {avg_loss:.4f} | "
+            f"Time: {epoch_minutes:.2f} min"
+        )
 
         # 5. Save Checkpoints
         if (epoch + 1) % 10 == 0:
-            checkpoint_path = os.path.join(save_dir, f"zeroidir_epoch_{epoch+1}.pth")
-            torch.save(model.state_dict(), checkpoint_path)
+            checkpoint_path = os.path.join(
+                save_dir,
+                f"zeroidir_epoch_{epoch + 1}.pth"
+            )
+
+            torch.save(
+                model.state_dict(),
+                checkpoint_path
+            )
+
             print(f"Saved checkpoint: {checkpoint_path}")
 
     print("Training complete!")
+
 
 if __name__ == "__main__":
     train()
